@@ -1,0 +1,142 @@
+import pandas as pd
+import requests
+from datetime import datetime
+import unicodedata  # Biblioteca para normalizar strings
+from sqlalchemy import create_engine, text
+
+def normalize_text(text):
+    """
+    Remove acentos e caracteres especiais de uma string.
+    """
+    if text is not None:
+        return unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8")
+    return ""
+
+def parse_data_referencia(data_raw):
+    tipo = data_raw[0]  # A ou S
+    mes = int(data_raw[1:3])
+    ano = int(data_raw[3:])
+    if tipo == "A":
+        return datetime(ano, 12, 31).date(), "A"
+    elif tipo == "S":
+        return datetime(ano, 6 if mes == 6 else 12, 30).date(), "S"
+    return None, None
+
+# Parâmetros de consulta
+periodos = ["202412"]
+cnpjs = ["06043050"]
+base_url = "https://www3.bcb.gov.br/informes/rest/balanco/download/{}-9011-{}.json"
+
+dados = []
+for periodo in periodos:
+    for cnpj in cnpjs:
+        url = base_url.format(periodo, cnpj)
+        try:
+            resposta = requests.get(url)
+            if resposta.status_code == 200:
+                json_data = resposta.json()
+                if "DemonstracaoDoResultado" not in json_data or "BalancoPatrimonial" not in json_data:
+                    print(f"Erro: Blocos 'DemonstracaoDoResultado' ou 'BalancoPatrimonial' não encontrados no JSON.")
+                    continue
+
+                datas_ref = {item["@id"]: item["@data"] for item in json_data["datasBaseReferencia"]}
+
+                # DemonstracaoDoResultado
+                for conta in json_data["DemonstracaoDoResultado"]["contas"]:
+                    cid = conta.get("@id")
+                    desc = conta.get("@descricao")
+                    desc_norm = normalize_text(desc)
+                    for v in conta.get("valoresIndividualizados", []):
+                        dtb = v["@dtBase"]
+                        val = v["@valor"]
+                        data_real = datas_ref.get(dtb, dtb)
+                        data_fmt, tipo = parse_data_referencia(data_real)
+                        dados.append({
+                            "cnpj": cnpj,
+                            "periodo": periodo,
+                            "conta_id": cid,
+                            "descricao": desc,
+                            "descricao_normalizada": desc_norm,
+                            "data_referencia": data_fmt,
+                            "tipo_periodo": tipo,
+                            "valor": float(val) if val is not None else None,
+                            "tipo_bloco": "DemonstracaoDoResultado"
+                        })
+
+                # BalancoPatrimonial
+                for conta in json_data["BalancoPatrimonial"]["contas"]:
+                    cid = conta.get("@id")
+                    desc = conta.get("@descricao")
+                    desc_norm = normalize_text(desc)
+                    for v in conta.get("valoresIndividualizados", []):
+                        dtb = v["@dtBase"]
+                        val = v["@valor"]
+                        data_real = datas_ref.get(dtb, dtb)
+                        data_fmt, tipo = parse_data_referencia(data_real)
+                        dados.append({
+                            "cnpj": cnpj,
+                            "periodo": periodo,
+                            "conta_id": cid,
+                            "descricao": desc,
+                            "descricao_normalizada": desc_norm,
+                            "data_referencia": data_fmt,
+                            "tipo_periodo": tipo,
+                            "valor": float(val) if val is not None else None,
+                            "tipo_bloco": "BalancoPatrimonial"
+                        })
+            else:
+                print(f"Erro {resposta.status_code}: {url}")
+        except Exception as e:
+            print(f"Erro ao acessar {url}: {e}")
+
+# Monta DataFrame
+df = pd.DataFrame(dados)
+
+if df.empty:
+    print("Nenhum dado encontrado, o DataFrame está vazio.")
+else:
+    if "descricao_normalizada" in df.columns:
+        lucros_liquidos = df[df["descricao_normalizada"].str.contains("lucro liquido", case=False, na=False)]
+        if lucros_liquidos.empty:
+            print("Nenhum dado de 'LUCRO LÍQUIDO' encontrado no JSON processado.")
+        else:
+            print("Dados de 'LUCRO LÍQUIDO' encontrados!")
+            print(lucros_liquidos)
+    else:
+        print("A coluna 'descricao_normalizada' não foi encontrada no DataFrame.")
+
+print(df.head())
+
+# Salva Excel
+df.to_excel("dados_para_postgresql_base_9.xlsx", index=False)
+print("[OK] Excel salvo com sucesso: dados_para_postgresql_base_9.xlsx")
+
+# === Conexão e gravação no Postgres ===
+
+# Ajuste estas variáveis com suas credenciais
+user = 'SEU_USUARIO'
+password = 'SUA_SENHA'
+host = 'consorcio.intranet.bb.com.br'
+port = '5432'
+database = 'intranet'
+
+# Cria engine
+engine = create_engine(
+    f'postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}'
+)
+
+with engine.begin() as conn:
+    # 1) Limpa a tabela alvo
+    conn.execute(text("DELETE FROM pwbi.bacen_contabel"))
+    # 2) Insere todos os registros
+    df.to_sql(
+        'bacen_contabel',
+        conn,
+        schema='pwbi',
+        if_exists='append',
+        index=False
+    )
+    # 3) Registra timestamp de atualização
+    conn.execute(text("INSERT INTO pwbi.bacen_contabel_dt_atlz DEFAULT VALUES"))
+
+print("Dados importados para pwbi.bacen_contabel e registro de atualização inserido com sucesso.")
